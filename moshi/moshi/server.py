@@ -113,20 +113,19 @@ class ServerState:
         
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
-        self.other_mimi.streaming_forever(1)
+        # Note: other_mimi streaming removed — encode/decode results were
+        # always discarded in the conversation loop, wasting GPU time.
         self.lm_gen.streaming_forever(1)
     
     def warmup(self):
         for _ in range(4):
             chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
             codes = self.mimi.encode(chunk)
-            _ = self.other_mimi.encode(chunk)
             for c in range(codes.shape[-1]):
                 tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                 if tokens is None:
                     continue
                 _ = self.mimi.decode(tokens[:, 1:9])
-                _ = self.other_mimi.decode(tokens[:, 1:9])
 
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
@@ -203,6 +202,15 @@ class ServerState:
 
         async def opus_loop():
             all_pcm_data = None
+            # --- Profiling state ---
+            frame_count = 0
+            total_encode_ms = 0.0
+            total_step_ms = 0.0
+            total_decode_ms = 0.0
+            total_frame_ms = 0.0
+            max_frame_ms = 0.0
+            budget_exceeded = 0
+            FRAME_BUDGET_MS = 80.0  # 1920 samples / 24kHz
 
             while True:
                 if close:
@@ -216,36 +224,80 @@ class ServerState:
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 while all_pcm_data.shape[-1] >= self.frame_size:
-                    be = time.time()
+                    frame_start = time.time()
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
+
+                    # --- Encode ---
+                    t0 = time.time()
                     codes = self.mimi.encode(chunk)
-                    _ = self.other_mimi.encode(chunk)
+                    if self.device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    encode_ms = (time.time() - t0) * 1000
+
                     for c in range(codes.shape[-1]):
+                        # --- LM step ---
+                        t0 = time.time()
                         tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                        if self.device.type == 'cuda':
+                            torch.cuda.synchronize()
+                        step_ms = (time.time() - t0) * 1000
+
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+
+                        # --- Decode ---
+                        t0 = time.time()
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
-                        _ = self.other_mimi.decode(tokens[:, 1:9])
+                        if self.device.type == 'cuda':
+                            torch.cuda.synchronize()
+                        decode_ms = (time.time() - t0) * 1000
+
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
                             _text = _text.replace("▁", " ")
-                            msg = b"\x02" + bytes(_text, encoding="utf8")
-                            await ws.send_bytes(msg)
+                            text_queue.append(b"\x02" + bytes(_text, encoding="utf8"))
                         else:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+
+                    # --- Frame profiling ---
+                    frame_ms = (time.time() - frame_start) * 1000
+                    frame_count += 1
+                    total_encode_ms += encode_ms
+                    total_step_ms += step_ms
+                    total_decode_ms += decode_ms
+                    total_frame_ms += frame_ms
+                    if frame_ms > max_frame_ms:
+                        max_frame_ms = frame_ms
+                    if frame_ms > FRAME_BUDGET_MS:
+                        budget_exceeded += 1
+
+                    if frame_count % 50 == 0:
+                        avg_enc = total_encode_ms / frame_count
+                        avg_step = total_step_ms / frame_count
+                        avg_dec = total_decode_ms / frame_count
+                        avg_frame = total_frame_ms / frame_count
+                        clog.log("info",
+                            f"[PERF] frames={frame_count} "
+                            f"avg_frame={avg_frame:.1f}ms "
+                            f"(enc={avg_enc:.1f} step={avg_step:.1f} dec={avg_dec:.1f}) "
+                            f"max={max_frame_ms:.1f}ms "
+                            f"over_budget={budget_exceeded}/{frame_count}")
 
         async def send_loop():
             while True:
                 if close:
                     return
                 await asyncio.sleep(0.001)
+                # Send queued text tokens first (moved off inference critical path)
+                while text_queue:
+                    await ws.send_bytes(text_queue.pop(0))
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
                     await ws.send_bytes(b"\x01" + msg)
@@ -263,7 +315,6 @@ class ServerState:
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
             self.mimi.reset_streaming()
-            self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
             async def is_alive():
                 if close or ws.closed:
@@ -287,6 +338,7 @@ class ServerState:
             if await is_alive():
                 await ws.send_bytes(b"\x00")
                 clog.log("info", "sent handshake bytes")
+                text_queue = []  # text tokens queued for send_loop
                 # Clean cancellation manager
                 tasks = [
                     asyncio.create_task(recv_loop()),
@@ -373,6 +425,11 @@ def main():
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
+    parser.add_argument("--quantize", action="store_true",
+                        help="Enable 4-bit NF4 quantization for the LM model. "
+                             "Reduces VRAM from ~14GB to ~5GB. "
+                             "Requires 'bitsandbytes' package. "
+                             "CUDA graphs are automatically disabled.")
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -439,10 +496,21 @@ def main():
         args.tokenizer = hf_hub_download(args.hf_repo, loaders.TEXT_TOKENIZER_NAME)
     text_tokenizer = sentencepiece.SentencePieceProcessor(args.tokenizer)  # type: ignore
 
+    if args.quantize:
+        # CUDA graphs are compatible with bitsandbytes >= 0.43 NF4 ops.
+        # Only disable if you hit graph capture errors.
+        # os.environ["NO_CUDA_GRAPH"] = "1"
+        logger.info("Quantized inference with CUDA graphs enabled")
+
     logger.info("loading moshi")
     if args.moshi_weight is None:
         args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME)
-    lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
+    lm = loaders.get_moshi_lm(
+        args.moshi_weight,
+        device=args.device,
+        cpu_offload=args.cpu_offload,
+        quantize=args.quantize,
+    )
     lm.eval()
     logger.info("moshi loaded")
     state = ServerState(

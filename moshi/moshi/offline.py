@@ -169,6 +169,7 @@ def run_inference(
     greedy: bool,
     save_voice_prompt_embeddings: bool,
     cpu_offload: bool = False,
+    quantize: bool = False,
 ):
     """Run offline inference using an input WAV as the user-side stream.
 
@@ -203,7 +204,7 @@ def run_inference(
     log("info", "loading moshi")
     if moshi_weight is None:
         moshi_weight = hf_hub_download(hf_repo, loaders.MOSHI_NAME)  # type: ignore
-    lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=cpu_offload)
+    lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=cpu_offload, quantize=quantize)
     lm.eval()
     log("info", "moshi loaded")
 
@@ -380,6 +381,10 @@ def main():
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
+    parser.add_argument("--quantize", action="store_true",
+                        help="Enable 4-bit NF4 quantization for the LM model. "
+                             "Reduces VRAM from ~14GB to ~5GB. "
+                             "Requires 'bitsandbytes' package.")
     parser.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (-1 disables)")
 
     args = parser.parse_args()
@@ -404,6 +409,12 @@ def main():
     # Normalize greedy flag behavior (True if present, False otherwise)
     greedy = bool(args.greedy)
 
+    if args.quantize:
+        # CUDA graphs are compatible with bitsandbytes >= 0.43 NF4 ops.
+        # Only disable if you hit graph capture errors.
+        # os.environ["NO_CUDA_GRAPH"] = "1"
+        pass
+
     with torch.no_grad():
         run_inference(
             input_wav=args.input_wav,
@@ -424,6 +435,7 @@ def main():
             greedy=greedy,
             save_voice_prompt_embeddings=False,
             cpu_offload=args.cpu_offload,
+            quantize=args.quantize,
         )
 
 

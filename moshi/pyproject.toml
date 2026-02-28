@@ -2,6 +2,11 @@
 name = "moshi-personaplex"
 requires-python = ">= 3.10"
 description = "Personaplex finetune of moshi to enable role and voice control."
+authors = [{name = "Rajarshi Roy", email = "rajarshir@nvidia.com"}]
+maintainers = [{name = "Rajarshi Roy", email = "rajarshir@nvidia.com"}]
+license = {text = "MIT"}
+dynamic = ["version"]
+readme = "README.md"
 dependencies = [
     "numpy >= 1.26, < 2.2",
     "safetensors >= 0.4.0, < 0.5",
@@ -13,11 +18,11 @@ dependencies = [
     "torch >= 2.2.0, < 2.5",
     "aiohttp>=3.10.5, <3.11",
 ]
-authors = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
-maintainers = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
-license = {text = "MIT"}
-dynamic = ["version"]
-readme = "README.md"
+
+[project.optional-dependencies]
+quantize = [
+    "bitsandbytes >= 0.43",
+]
 
 [project.scripts]
 moshi-server = "moshi.server:main"

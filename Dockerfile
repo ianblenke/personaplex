@@ -1,5 +1,5 @@
 ARG BASE_IMAGE="nvcr.io/nvidia/cuda"
-ARG BASE_IMAGE_TAG="12.4.1-runtime-ubuntu22.04"
+ARG BASE_IMAGE_TAG="12.2.2-runtime-ubuntu22.04"
 
 FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} AS base
 
@@ -16,6 +16,7 @@ WORKDIR /app/moshi/
 COPY moshi/ /app/moshi/
 RUN uv venv /app/moshi/.venv --python 3.12
 RUN uv sync
+RUN uv pip install bitsandbytes>=0.43
 
 RUN mkdir -p /app/ssl
 

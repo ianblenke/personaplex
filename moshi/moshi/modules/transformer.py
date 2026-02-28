@@ -353,16 +353,24 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         self.rope = rope
         self.num_heads = num_heads
 
-        out_dim = embed_dim
         out_dim = 3 * embed_dim
         mult = 1
         self.weights_per_step = weights_per_step
+        self._compute_dtype = dtype or torch.bfloat16
         if weights_per_step:
             mult = weights_per_step
-        in_proj = nn.Linear(embed_dim, mult * out_dim, bias=False, **factory_kwargs)
-        # We try to follow the default PyTorch MHA convention, to easily compare results.
-        self.in_proj_weight = in_proj.weight
-        self.in_proj_bias = in_proj.bias
+            # weights_per_step path (depformer): keep raw parameter for
+            # multi_linear which needs to slice the weight tensor.
+            in_proj = nn.Linear(embed_dim, mult * out_dim, bias=False, **factory_kwargs)
+            self.in_proj_weight = in_proj.weight
+            self.in_proj_bias = in_proj.bias
+            self.in_proj = None
+        else:
+            # Standard path: proper nn.Linear module so it can be discovered
+            # and replaced by quantization.
+            self.in_proj = nn.Linear(embed_dim, out_dim, bias=False, **factory_kwargs)
+            self.in_proj_weight = None
+            self.in_proj_bias = None
         self.out_proj = nn.Linear(
             embed_dim, mult * embed_dim, bias=False, **factory_kwargs
         )
@@ -377,9 +385,16 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
                 )
         else:
             capacity = self.context
-        device = self.in_proj_weight.device
-        # TODO: the following estimation will not work great with FSDP.
-        dtype = self.in_proj_weight.dtype
+        if self.in_proj is not None:
+            device = self.in_proj.weight.device
+            dtype = self.in_proj.weight.dtype
+            # When quantized (e.g. NF4), the stored weight dtype is uint8.
+            # Use the compute dtype for the KV cache instead.
+            if dtype == torch.uint8:
+                dtype = self._compute_dtype
+        else:
+            device = self.in_proj_weight.device
+            dtype = self.in_proj_weight.dtype
         dim_per_head = self.embed_dim // self.num_heads
         kv_cache = RingKVCache(
             batch_size, self.num_heads, dim_per_head, capacity, device, dtype
@@ -414,7 +429,7 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
                 self.weights_per_step, self.in_proj_weight, query, offset_cpu
             )
         else:
-            projected = nn.functional.linear(query, self.in_proj_weight)
+            projected = self.in_proj(query)
         q, k, v = rearrange(
             projected, "b t (p h d) -> p b h t d", p=3, h=self.num_heads
         )

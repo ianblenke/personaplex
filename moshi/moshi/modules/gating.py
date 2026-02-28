@@ -30,6 +30,15 @@ from torch.nn import functional as F
 from ..utils.compile import torch_compile_lazy
 
 
+def _is_quantized(module: nn.Module) -> bool:
+    """Check if a module is a bitsandbytes quantized linear layer."""
+    try:
+        import bitsandbytes as bnb
+        return isinstance(module, (bnb.nn.Linear4bit, bnb.nn.Linear8bitLt))
+    except ImportError:
+        return False
+
+
 @torch_compile_lazy
 def gating_forward_kernel(
     weight_in: torch.Tensor, weight_out: torch.Tensor, activation, x: torch.Tensor
@@ -67,6 +76,16 @@ class ActivationGating(nn.Module):
         self.activation = activation
 
     def forward(self, x: torch.Tensor):
+        if _is_quantized(self.linear_in):
+            # Quantized path: call modules directly so bitsandbytes handles
+            # dequantization internally via its Linear4bit.forward().
+            x = self.linear_in(x)
+            B, T, _ = x.shape
+            x = x.view(B, T, 2, -1)
+            x = self.activation(x[..., 0, :]) * x[..., 1, :]
+            x = self.linear_out(x)
+            return x
+        # Original optimized path with compiled kernel.
         return gating_forward_kernel(
             self.linear_in.weight, self.linear_out.weight, self.activation, x
         )

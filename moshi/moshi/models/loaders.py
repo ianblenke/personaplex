@@ -35,6 +35,7 @@ from .compression import MimiModel
 from .lm import LMModel
 from ..modules import SEANetEncoder, SEANetDecoder, transformer
 from ..quantization import SplitResidualVectorQuantizer
+from ..utils.quantize import replace_linear_with_4bit, remap_state_dict_keys
 
 SAMPLE_RATE = 24000
 FRAME_RATE = 12.5
@@ -155,10 +156,12 @@ def get_mimi(filename: str | Path,
     ).to(device=device)
     model.eval()
     if _is_safetensors(filename):
-        load_model(model, filename)
+        state_dict = load_file(filename, device=str(device))
     else:
         pkg = torch.load(filename, "cpu")
-        model.load_state_dict(pkg["model"])
+        state_dict = pkg["model"]
+    state_dict = remap_state_dict_keys(state_dict)
+    model.load_state_dict(state_dict, strict=True, assign=True)
     model.set_num_codebooks(8)
     return model
 
@@ -170,6 +173,7 @@ def get_moshi_lm(
     dtype: torch.dtype = torch.bfloat16,
     delays=None,
     cpu_offload: bool = False,
+    quantize: bool = False,
 ) -> LMModel:
     """Return a pretrained Moshi LM model.
 
@@ -181,6 +185,8 @@ def get_moshi_lm(
         delays: Optional custom delays configuration.
         cpu_offload: If True, offload model layers to CPU when GPU memory is
                      insufficient. Uses accelerate's device_map="auto".
+        quantize: If True, quantize Linear layers to 4-bit NF4 using
+                  bitsandbytes.  Requires the ``bitsandbytes`` package.
     """
     # Copy to avoid mutating a shared/global dict
     lm_kwargs = dict(_lm_kwargs)
@@ -203,11 +209,12 @@ def get_moshi_lm(
 
     filename = str(filename)
 
-    # Load state_dict
+    # Load state_dict -- when quantizing, always load to CPU first so that
+    # moving to CUDA triggers bitsandbytes NF4 quantization.
     if filename.endswith(".safetensors"):
         # safetensors does not support mps directly
         dev = torch.device(device) if isinstance(device, str) else device
-        if dev.type == "mps":
+        if dev.type == "mps" or quantize:
             state_dict = load_file(filename, device="cpu")
         else:
             state_dict = load_file(filename, device=dev.type)
@@ -215,6 +222,11 @@ def get_moshi_lm(
         # torch checkpoint
         with open(filename, "rb") as f:
             state_dict = torch.load(f, map_location="cpu")
+
+    # Remap old checkpoint keys (in_proj_weight -> in_proj.weight) for the
+    # main transformer attention refactor.  Safe no-op for new checkpoints.
+    state_dict = remap_state_dict_keys(state_dict)
+
     # Patch 1: expand depformer self_attn weights if needed
     model_sd = model.state_dict()
     for name, tensor in list(state_dict.items()):
@@ -250,14 +262,33 @@ def get_moshi_lm(
             if not replaced:
                 print("Missing %s", name)
 
-    # Assign weights to target device
-    dev = torch.device(device) if isinstance(device, str) else device
-    for key in state_dict:
-        state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
-    
-    model.load_state_dict(state_dict, strict=False, assign=True)
-    model.eval()
-    return model.to(device=device, dtype=dtype)
+    if quantize:
+        logger.info("Applying 4-bit NF4 quantization to LM model")
+        # 1. Load weights into model on CPU first (as regular nn.Linear).
+        for key in state_dict:
+            state_dict[key] = state_dict[key].to(dtype=dtype)
+        model.load_state_dict(state_dict, strict=False, assign=True)
+        # 2. Replace nn.Linear with Linear4bit, copying loaded weights
+        #    into Params4bit tensors.  Skip depformer (uses
+        #    weights_per_step / multi_linear which slices raw weight
+        #    tensors -- incompatible with quantized weights).
+        model = replace_linear_with_4bit(
+            model,
+            skip_patterns=["depformer"],
+            compute_dtype=dtype,
+        )
+        # 3. Move to CUDA -- Params4bit.to(device) triggers NF4
+        #    quantization.
+        model.eval()
+        return model.to(device=device)
+    else:
+        # Original non-quantized path
+        dev = torch.device(device) if isinstance(device, str) else device
+        for key in state_dict:
+            state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
+        model.load_state_dict(state_dict, strict=False, assign=True)
+        model.eval()
+        return model.to(device=device, dtype=dtype)
 
 
 def _get_moshi_lm_with_offload(
@@ -293,6 +324,9 @@ def _get_moshi_lm_with_offload(
     else:
         with open(filename, "rb") as f:
             state_dict = torch.load(f, map_location="cpu")
+
+    # Remap old checkpoint keys for the in_proj refactor.
+    state_dict = remap_state_dict_keys(state_dict)
 
     # Apply weight patches (same as non-offload path)
     model_sd = model.state_dict()

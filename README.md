@@ -159,6 +159,86 @@ Personaplex finetunes Moshi and benefits from the generalization capabilities of
 You enjoy having a good conversation. Have a technical discussion about fixing a reactor core on a spaceship to Mars. You are an astronaut on a Mars mission. Your name is Alex. You are already dealing with a reactor core meltdown on a Mars mission. Several ship systems are failing, and continued instability will lead to catastrophic failure. You explain what is happening and you urgently ask for help thinking through how to stabilize the reactor.
 ```
 
+## LiveKit Integration
+
+PersonaPlex can be used as a real-time voice AI agent via [LiveKit](https://livekit.io/) using the included `livekit-plugins-moshi` plugin. This bridges PersonaPlex's full-duplex WebSocket protocol into LiveKit's `RealtimeModel` interface, letting you connect users via WebRTC through LiveKit rooms.
+
+### Architecture
+
+```
+LiveKit Room (WebRTC, any client)
+    ↕ PCM AudioFrames
+livekit-plugins-moshi (MoshiRealtimeSession)
+    ↕ Opus over WebSocket
+PersonaPlex Server (:8998)
+```
+
+### Setup
+
+1. **Install the plugin** (requires Python 3.10+):
+```bash
+cd livekit-plugins-moshi
+pip install -e .
+```
+
+2. **Start the PersonaPlex server** (see [Launch Server](#launch-server) above).
+
+3. **Start a LiveKit server** ([self-hosting docs](https://docs.livekit.io/home/self-hosting/local/)):
+```bash
+# Example with livekit-server binary
+livekit-server --dev
+```
+
+4. **Run the agent**:
+```bash
+export LIVEKIT_URL=ws://localhost:7880
+export LIVEKIT_API_KEY=devkey
+export LIVEKIT_API_SECRET=secret
+
+python livekit-plugins-moshi/example_agent.py dev
+```
+
+5. **Connect a client** — use the [LiveKit Agents Playground](https://agents-playground.livekit.io/) or any LiveKit client SDK.
+
+### Usage in Code
+
+```python
+from livekit.agents import Agent, AgentSession, WorkerOptions, cli
+from livekit.plugins.moshi import MoshiRealtimeModel
+
+class MyAgent(Agent):
+    def __init__(self):
+        super().__init__(instructions="You are a helpful assistant.")
+
+async def entrypoint(ctx: cli.JobContext):
+    await ctx.connect()
+    session = AgentSession(
+        llm=MoshiRealtimeModel(
+            server_url="ws://localhost:8998",
+            voice="NATM1",
+            text_prompt="You are a friendly assistant.",
+            text_temperature=0.7,
+            audio_temperature=0.8,
+        ),
+    )
+    await session.start(agent=MyAgent(), room=ctx.room)
+
+if __name__ == "__main__":
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+```
+
+All voice options (NATM0–3, NATF0–3, VARM0–4, VARF0–4) and text prompts described in the [Voices](#voices) and [Prompting Guide](#prompting-guide) sections work with the LiveKit plugin.
+
+### Known Limitations
+
+- **Requires a running PersonaPlex server** — the plugin connects via WebSocket and does not load the model in-process.
+- **No mid-session updates** — Moshi does not support changing instructions, persona, or voice after the session starts. These must be set at connection time.
+- **No tool/function calling** — Moshi is a speech-to-speech model and does not support LLM tool use.
+- **No message truncation** — the `truncate()` method is a no-op since Moshi doesn't support rewinding output.
+- **Full-duplex interruption** — Moshi handles interruptions natively (it adjusts when the user speaks). LiveKit's explicit `interrupt()` ends the current output stream, but the model continues to listen and respond naturally.
+- **Audio resampling** — input audio is resampled from LiveKit's sample rate (typically 48kHz) to Moshi's 24kHz using linear interpolation, which is adequate for voice but not lossless.
+- **Single concurrent session** — the PersonaPlex server holds a lock per connection, so only one LiveKit agent session can be active at a time per server instance.
+
 ## License
 
 The present code is provided under the MIT license. The weights for the models are released under the NVIDIA Open Model license.

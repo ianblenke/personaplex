@@ -7,8 +7,10 @@ services:
       - "8998:8998"
     environment:
       - NO_TORCH_COMPILE=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     env_file:
       - .env
+    command: ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl", "--quantize"]
     deploy:
       resources:
         reservations:
@@ -18,3 +20,5 @@ services:
               capabilities: [ gpu ]
     volumes:
       - ./.cache:/root/.cache
+    dns:
+      - 8.8.8.8
